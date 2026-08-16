@@ -37,6 +37,11 @@ class A2dpSourceSpeaker : public Component, public speaker::Speaker {
   void set_max_bitpool(uint8_t max_bitpool) { this->max_bitpool_ = max_bitpool; }
   void set_buffer_duration(uint32_t duration_ms) { this->buffer_duration_ms_ = duration_ms; }
 
+  float get_buffer_level_ms() const;
+  float take_recent_silence_percent();
+  uint32_t get_underflow_events() const { return this->diagnostic_underflow_events_.load(); }
+  bool is_a2dp_connected() const;
+
  protected:
   enum class ConnectionState : uint8_t { DISCONNECTED, CONNECTING, CONNECTED };
   enum class MediaState : uint8_t { IDLE, CHECKING, STARTING, STARTED, SUSPENDING };
@@ -92,6 +97,10 @@ class A2dpSourceSpeaker : public Component, public speaker::Speaker {
   std::atomic<int64_t> stats_last_callback_us_{0};
   std::atomic<bool> stats_report_requested_{false};
   std::atomic<uint64_t> callback_source_frame_remainder_{0};
+  std::atomic<uint64_t> diagnostic_requested_bytes_{0};
+  std::atomic<uint64_t> diagnostic_silence_bytes_{0};
+  std::atomic<uint32_t> diagnostic_underflow_events_{0};
+  std::atomic<bool> diagnostic_underflow_active_{false};
 
   uint32_t next_connect_at_{0};
   uint32_t next_media_check_at_{0};

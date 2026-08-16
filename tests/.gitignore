@@ -1,0 +1,3 @@
+# ESPHome's local test build output and any test-only secrets.
+/.esphome/
+/secrets.yaml

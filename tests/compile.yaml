@@ -56,5 +56,37 @@ media_player:
     announcement_pipeline:
       speaker: a2dp_output
       format: MP3
-      sample_rate: 44100
-      num_channels: 2
+      sample_rate: 22050
+      num_channels: 1
+
+sensor:
+  - platform: wifi_signal
+    name: Wi-Fi RSSI
+    update_interval: 5s
+  - platform: template
+    name: A2DP buffer level
+    unit_of_measurement: ms
+    update_interval: 5s
+    lambda: return id(a2dp_output).get_buffer_level_ms();
+  - platform: template
+    name: A2DP recent silence
+    unit_of_measurement: "%"
+    update_interval: 5s
+    lambda: return id(a2dp_output).take_recent_silence_percent();
+  - platform: template
+    name: A2DP underflow events
+    accuracy_decimals: 0
+    update_interval: 5s
+    lambda: return id(a2dp_output).get_underflow_events();
+
+binary_sensor:
+  - platform: template
+    name: A2DP connected
+    lambda: return id(a2dp_output).is_a2dp_connected();
+
+text_sensor:
+  - platform: wifi_info
+    ip_address:
+      name: IP address
+    bssid:
+      name: Wi-Fi BSSID

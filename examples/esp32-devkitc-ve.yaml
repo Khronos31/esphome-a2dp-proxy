@@ -8,6 +8,9 @@ esphome:
   name: ${name}
   friendly_name: ${friendly_name}
   min_version: 2026.7.4
+  project:
+    name: Khronos31.esphome-a2dp-proxy
+    version: "0.1.0"
 
 esp32:
   # ESP32-DevKitC-VE with an ESP32-WROVER-E module and 8 MB flash.
@@ -21,7 +24,7 @@ esp32:
 psram:
 
 external_components:
-  - source: github://Khronos31/esphome-a2dp-proxy@main
+  - source: github://Khronos31/esphome-a2dp-proxy@v0.1.0
     components: [a2dp_source]
 
 logger:
@@ -62,5 +65,5 @@ media_player:
       # Home Assistant transcodes media-source inputs (including M4A/AAC) to
       # this advertised format before the ESP32 downloads them.
       format: MP3
-      sample_rate: 44100
-      num_channels: 2
+      sample_rate: 22050
+      num_channels: 1

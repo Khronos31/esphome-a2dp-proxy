@@ -102,6 +102,30 @@ A2dpSourceSpeaker *A2dpSourceSpeaker::instance_ = nullptr;
 
 float A2dpSourceSpeaker::get_setup_priority() const { return setup_priority::HARDWARE; }
 
+bool A2dpSourceSpeaker::is_a2dp_connected() const {
+  return this->connection_state_.load() == ConnectionState::CONNECTED;
+}
+
+float A2dpSourceSpeaker::get_buffer_level_ms() const {
+  if (this->audio_ring_buffer_ == nullptr) {
+    return 0.0f;
+  }
+  return static_cast<float>(this->audio_ring_buffer_->available()) * 1000.0f /
+         static_cast<float>(SAMPLE_RATE * OUTPUT_FRAME_BYTES);
+}
+
+float A2dpSourceSpeaker::take_recent_silence_percent() {
+  const uint64_t requested = this->diagnostic_requested_bytes_.exchange(0);
+  const uint64_t silence = this->diagnostic_silence_bytes_.exchange(0);
+  if (requested == 0) {
+    return NAN;
+  }
+  // The callback updates the two counters independently. Clamp the diagnostic
+  // snapshot so a read between those updates cannot briefly report >100%.
+  return static_cast<float>(std::min(silence, requested)) * 100.0f /
+         static_cast<float>(requested);
+}
+
 void A2dpSourceSpeaker::setup() {
   if (instance_ != nullptr) {
     ESP_LOGE(TAG, "Only one A2DP source speaker is supported");
@@ -693,7 +717,18 @@ int32_t A2dpSourceSpeaker::fill_audio_(uint8_t *data, int32_t length) {
   this->stats_input_bytes_consumed_.fetch_add(output_bytes_read);
   this->stats_output_bytes_requested_.fetch_add(static_cast<uint64_t>(length));
   const size_t output_audio_bytes = output_frames_read * OUTPUT_FRAME_BYTES;
-  this->stats_silence_bytes_.fetch_add(static_cast<uint64_t>(length) - output_audio_bytes);
+  const uint64_t silence_bytes = static_cast<uint64_t>(length) - output_audio_bytes;
+  this->stats_silence_bytes_.fetch_add(silence_bytes);
+  this->diagnostic_requested_bytes_.fetch_add(static_cast<uint64_t>(length));
+  this->diagnostic_silence_bytes_.fetch_add(silence_bytes);
+  const bool underflow = silence_bytes > 0;
+  if (underflow) {
+    if (!this->diagnostic_underflow_active_.exchange(true)) {
+      this->diagnostic_underflow_events_.fetch_add(1);
+    }
+  } else {
+    this->diagnostic_underflow_active_.store(false);
+  }
 
   this->apply_volume_(reinterpret_cast<int16_t *>(data), output_frames_read * 2);
   if (output_frames_read > 0) {
@@ -721,6 +756,10 @@ void A2dpSourceSpeaker::reset_playback_stats_() {
   this->stats_first_callback_us_.store(0);
   this->stats_last_callback_us_.store(0);
   this->stats_report_requested_.store(false);
+  this->diagnostic_requested_bytes_.store(0);
+  this->diagnostic_silence_bytes_.store(0);
+  this->diagnostic_underflow_events_.store(0);
+  this->diagnostic_underflow_active_.store(false);
 }
 
 void A2dpSourceSpeaker::report_playback_stats_() {
