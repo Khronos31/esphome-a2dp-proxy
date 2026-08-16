@@ -15,8 +15,6 @@ esp32:
   flash_size: 8MB
   framework:
     type: esp-idf
-    sdkconfig_options:
-      CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: y
     advanced:
       minimum_chip_revision: "3.1"
 
@@ -27,6 +25,10 @@ external_components:
     components: [a2dp_source]
 
 logger:
+  logs:
+    # The Classic Bluetooth stack can emit this tag at a very high rate while
+    # streaming. API log forwarding then competes with real-time audio work.
+    esp-idf: NONE
 
 wifi:
   ssid: !secret wifi_ssid
@@ -45,23 +47,20 @@ speaker:
   - platform: a2dp_source
     id: a2dp_output
     target_address: ${target_address}
+    # Reduces Bluetooth airtime enough for reliable simultaneous Wi-Fi input.
+    max_bitpool: 32
     buffer_duration: 750ms
-
-  - platform: resampler
-    id: a2dp_resampled
-    output_speaker: a2dp_output
-    bits_per_sample: 16
-    sample_rate: 44100
-    buffer_duration: 200ms
-    task_stack_in_psram: true
 
 media_player:
   - platform: speaker
     id: a2dp_media_player
     name: Bluetooth Speaker
     buffer_size: 400000
-    task_stack_in_psram: true
     volume_initial: 50%
     announcement_pipeline:
-      speaker: a2dp_resampled
-      format: NONE
+      speaker: a2dp_output
+      # Home Assistant transcodes media-source inputs (including M4A/AAC) to
+      # this advertised format before the ESP32 downloads them.
+      format: MP3
+      sample_rate: 44100
+      num_channels: 2

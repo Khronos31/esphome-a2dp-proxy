@@ -15,6 +15,7 @@ from esphome.const import (
 
 CONF_TARGET_ADDRESS = "target_address"
 CONF_DEVICE_NAME = "device_name"
+CONF_MAX_BITPOOL = "max_bitpool"
 
 a2dp_source_ns = cg.esphome_ns.namespace("a2dp_source")
 A2dpSourceSpeaker = a2dp_source_ns.class_(
@@ -40,8 +41,8 @@ def _set_stream_limits(config):
         max_bits_per_sample=16,
         min_channels=1,
         max_channels=2,
-        min_sample_rate=44100,
-        max_sample_rate=44100,
+        min_sample_rate=8000,
+        max_sample_rate=48000,
     )(config)
     return config
 
@@ -52,12 +53,13 @@ CONFIG_SCHEMA = cv.All(
             cv.GenerateID(): cv.declare_id(A2dpSourceSpeaker),
             cv.Required(CONF_TARGET_ADDRESS): _validate_bt_address,
             cv.Optional(CONF_DEVICE_NAME, default="ESPHome A2DP Proxy"): cv.string_strict,
+            cv.Optional(CONF_MAX_BITPOOL, default=32): cv.int_range(min=2, max=53),
             cv.Optional(
                 CONF_BUFFER_DURATION, default="500ms"
             ): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_BITS_PER_SAMPLE, default=16): cv.one_of(16, int=True),
             cv.Optional(CONF_NUM_CHANNELS, default=2): cv.int_range(min=1, max=2),
-            cv.Optional(CONF_SAMPLE_RATE, default=44100): cv.one_of(44100, int=True),
+            cv.Optional(CONF_SAMPLE_RATE, default=44100): cv.int_range(min=8000, max=48000),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
@@ -72,6 +74,7 @@ async def to_code(config):
 
     cg.add(var.set_target_address(config[CONF_TARGET_ADDRESS]))
     cg.add(var.set_device_name(config[CONF_DEVICE_NAME]))
+    cg.add(var.set_max_bitpool(config[CONF_MAX_BITPOOL]))
     cg.add(var.set_buffer_duration(config[CONF_BUFFER_DURATION]))
 
     esp32.request_bluetooth()
@@ -84,3 +87,14 @@ async def to_code(config):
     esp32.add_idf_sdkconfig_option("CONFIG_BTDM_CTRL_MODE_BR_EDR_ONLY", True)
     esp32.add_idf_sdkconfig_option("CONFIG_BTDM_CTRL_MODE_BLE_ONLY", False)
     esp32.add_idf_sdkconfig_option("CONFIG_BTDM_CTRL_MODE_BTDM", False)
+
+    # ESPHome 2026.7 leaves esp_http_client's transmit buffer at the ESP-IDF
+    # default of 512 bytes. Home Assistant My Media URLs can exceed that once
+    # their authentication signature is added. Route client construction
+    # through the bounded compatibility wrapper in a2dp_source_speaker.cpp.
+    cg.add_build_flag("-Wl,--wrap=esp_http_client_init")
+
+    # The legacy A2DP source API does not expose its SBC encoder bitrate.
+    # Intercept the encoder's negotiated configuration so max_bitpool remains
+    # user-configurable without forking ESP-IDF.
+    cg.add_build_flag("-Wl,--wrap=bta_av_co_audio_get_sbc_config")

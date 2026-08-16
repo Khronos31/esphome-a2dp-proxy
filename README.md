@@ -20,8 +20,8 @@ The first version supports:
 
 It has been built and run with ESPHome 2026.7.4 and ESP-IDF 5.5.5 on an
 ESP32-DevKitC-VE carrying an ESP32-WROVER-E module. Playback, stop, volume,
-TTS, reconnect after boot, and a complete 20-second MP3 were tested with a
-CLS-02 speaker.
+TTS, reconnect after boot, local flash playback, and streamed MP3 playback were
+tested with a CLS-02 speaker.
 
 ## Hardware requirements
 
@@ -60,9 +60,33 @@ external_components:
     components: [a2dp_source]
 ```
 
-The output speaker accepts 16-bit PCM at 44.1 kHz, mono or stereo. Use
-ESPHome's resampler in front of it so media with another sample rate is
-converted automatically. The complete wiring is in the example.
+The output speaker accepts 16-bit mono or stereo PCM from 8 to 48 kHz. It uses
+a lightweight fixed-point linear converter internally and feeds the legacy
+ESP-IDF A2DP source at 44.1 kHz stereo. The complete wiring is in the example.
+
+The example advertises MP3, 44.1 kHz stereo as its preferred announcement
+format. When content is selected through Home Assistant's media-source path,
+Home Assistant transcodes inputs such as M4A/AAC to that format before the
+ESP32 downloads them. This keeps AAC decoding off the device and avoids sending
+lossless PCM over the Wi-Fi/Bluetooth shared radio. An M4A selected from My
+Media was verified to arrive at the ESP32 as MP3 and play.
+
+This does not make arbitrary M4A HTTP URLs directly playable. Direct URLs do
+not pass through Home Assistant's transcoder, so they must already use a format
+compiled into ESPHome (MP3, FLAC, WAV, or Ogg/Opus in ESPHome 2026.7).
+
+`max_bitpool` controls the upper SBC bitpool advertised to ESP-IDF's encoder.
+It defaults to `32`, the stable value found on the tested WROVER-E while Wi-Fi
+was receiving a 192 kbit/s MP3 and Bluetooth was transmitting A2DP at the same
+time. The ESP-IDF default of `53` produced severe wireless dropouts in that
+test. Values from `2` to `53` are accepted, but lower is not automatically
+better: `24` made the tested ESP-IDF encoder path starve its PCM callback.
+
+Keep ESPHome's speaker media-player decode task in internal RAM. In particular,
+do not add `task_stack_in_psram: true` to the `media_player` configuration. On
+the original ESP32, a decode stack in PSRAM cannot reliably keep pace with a
+48 kHz MP3 while Wi-Fi and Bluetooth Classic are active, causing severe audio
+dropouts. Large file and PCM buffers still use PSRAM automatically.
 
 ## Important limitations
 
@@ -78,9 +102,15 @@ converted automatically. The complete wiring is in the example.
 - Only one A2DP source instance is supported per ESP32.
 - There is no pause, seek, metadata, microphone, HFP, LE Audio, synchronized
   playback, or Bluetooth proxying for unrelated devices.
-- Wi-Fi and Bluetooth share one 2.4 GHz radio. A 44.1 kHz stereo PCM WAV needs
-  about 176 kB/s and may underrun during direct HTTP playback. Compressed media
-  such as MP3 and normal Home Assistant TTS are the intended inputs.
+- Wi-Fi and Bluetooth share one 2.4 GHz radio. The default `max_bitpool: 32`
+  trades some SBC quality for coexistence stability. Results can still depend
+  on Wi-Fi congestion, RF range, the speaker, and the exact ESP32 module.
+  Compressed media such as MP3 and normal Home Assistant TTS are the intended
+  inputs; lossless or uncompressed streams put more load on the shared radio.
+- One longer Home Assistant My Media test saw the transcoded HTTP stream stop
+  producing data; ESPHome inserted silence and its standard audio reader timed
+  out after 30 seconds. The ESP32, Wi-Fi, and A2DP connections stayed up, and
+  the upstream cause has not yet been isolated.
 
 ## Implementation and provenance
 
@@ -92,6 +122,17 @@ evaluated `ESP32-A2DP` Arduino library.
 The ESP-IDF A2DP callback pulls PCM from the component's buffer. `start()` and
 `stop()` drive `ESP_A2D_MEDIA_CTRL_START` and `ESP_A2D_MEDIA_CTRL_SUSPEND`, so
 stopping playback suspends the media stream instead of sending silence forever.
+
+Home Assistant My Media uses long signed URLs. ESPHome 2026.7 leaves the
+ESP-IDF HTTP transmit buffer at 512 bytes, which is too small for some of those
+request lines. The component links a narrow compatibility wrapper that raises
+undersized HTTP transmit buffers to 4 KiB. It does not replace ESPHome's media
+reader or HTTP implementation.
+
+The legacy ESP-IDF A2DP source API also hard-codes an SBC maximum bitpool of
+53. A second narrow linker wrapper caps the encoder's negotiated maximum at the
+configured `max_bitpool`; it leaves the rest of ESP-IDF's codec negotiation
+unchanged.
 
 ## License
 

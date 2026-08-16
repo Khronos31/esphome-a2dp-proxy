@@ -2,6 +2,7 @@
 #include "a2dp_source_speaker.h"
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -11,9 +12,82 @@
 #include "esp_bt_device.h"
 #include "esp_bt_main.h"
 #include "esp_err.h"
+#include "esp_heap_caps.h"
+#include "esp_http_client.h"
 #include "esp_timer.h"
 #include "esphome/core/hal.h"
 #include "esphome/core/log.h"
+
+namespace {
+
+static constexpr int A2DP_HTTP_TX_BUFFER_SIZE = 4096;
+static constexpr int ESPHOME_AUDIO_HTTP_RX_BUFFER_SIZE = 2048;
+static constexpr uint8_t A2DP_DEFAULT_MAX_BITPOOL = 53;
+static const char *const HTTP_COMPAT_TAG = "a2dp_source.http";
+static const char *const SBC_COMPAT_TAG = "a2dp_source.sbc";
+
+// Private ESP-IDF Bluedroid type used by bta_av_co_audio_get_sbc_config().
+// Keep this local mirror byte-for-byte compatible with tA2D_SBC_CIE so the
+// linker wrapper does not require ESP-IDF's non-public Bluetooth headers.
+struct A2dpSbcCodecConfig {
+  uint8_t sample_frequency;
+  uint8_t channel_mode;
+  uint8_t block_length;
+  uint8_t subbands;
+  uint8_t allocation_method;
+  uint8_t max_bitpool;
+  uint8_t min_bitpool;
+};
+
+static std::atomic<uint8_t> a2dp_max_bitpool{A2DP_DEFAULT_MAX_BITPOOL};
+
+}  // namespace
+
+// ESPHome 2026.7 configures the audio reader's receive buffer but leaves its
+// transmit buffer at ESP-IDF's 512-byte default. Signed Home Assistant My
+// Media URLs can exceed that in the HTTP request line. The linker wrapper
+// recognizes AudioReader's exact configuration and raises only its default
+// transmit buffer. Other ESP-IDF HTTP users are left untouched.
+// esp_http_client_init copies the structure before returning, so the adjusted
+// stack copy is safe here.
+extern "C" esp_http_client_handle_t __real_esp_http_client_init(const esp_http_client_config_t *config);
+
+extern "C" esp_http_client_handle_t __wrap_esp_http_client_init(const esp_http_client_config_t *config) {
+  const bool is_esphome_audio_reader = config != nullptr && config->buffer_size_tx == 0 &&
+                                      config->buffer_size == ESPHOME_AUDIO_HTTP_RX_BUFFER_SIZE &&
+                                      config->keep_alive_enable && config->event_handler != nullptr &&
+                                      config->user_data != nullptr;
+  if (!is_esphome_audio_reader) {
+    return __real_esp_http_client_init(config);
+  }
+
+  const size_t free_before = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+  const size_t largest_before = heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL);
+  esp_http_client_config_t adjusted_config = *config;
+  adjusted_config.buffer_size_tx = A2DP_HTTP_TX_BUFFER_SIZE;
+  auto client = __real_esp_http_client_init(&adjusted_config);
+  ESP_LOGD(HTTP_COMPAT_TAG, "Audio HTTP TX buffer: %d bytes; internal heap free/largest: %u/%u -> %u/%u",
+           A2DP_HTTP_TX_BUFFER_SIZE, static_cast<unsigned>(free_before), static_cast<unsigned>(largest_before),
+           static_cast<unsigned>(heap_caps_get_free_size(MALLOC_CAP_INTERNAL)),
+           static_cast<unsigned>(heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL)));
+  return client;
+}
+
+extern "C" uint8_t __real_bta_av_co_audio_get_sbc_config(A2dpSbcCodecConfig *config, uint16_t *minimum_mtu);
+
+extern "C" uint8_t __wrap_bta_av_co_audio_get_sbc_config(A2dpSbcCodecConfig *config, uint16_t *minimum_mtu) {
+  const uint8_t result = __real_bta_av_co_audio_get_sbc_config(config, minimum_mtu);
+  if (result == 0 || config == nullptr) {
+    return result;
+  }
+
+  const uint8_t requested_max = a2dp_max_bitpool.load();
+  const uint8_t original_max = config->max_bitpool;
+  config->max_bitpool = std::max(config->min_bitpool, std::min(original_max, requested_max));
+  ESP_LOGD(SBC_COMPAT_TAG, "SBC bitpool range: %u-%u (negotiated max %u)", config->min_bitpool,
+           config->max_bitpool, original_max);
+  return result;
+}
 
 namespace esphome::a2dp_source {
 
@@ -22,7 +96,7 @@ static constexpr uint32_t RECONNECT_DELAY_MS = 5000;
 static constexpr uint32_t MEDIA_RETRY_DELAY_MS = 1000;
 static constexpr uint32_t SAMPLE_RATE = 44100;
 static constexpr size_t OUTPUT_FRAME_BYTES = sizeof(int16_t) * 2;
-static constexpr size_t MONO_SCRATCH_SAMPLES = 128;
+static constexpr size_t RESAMPLE_SCRATCH_FRAMES = 128;
 
 A2dpSourceSpeaker *A2dpSourceSpeaker::instance_ = nullptr;
 
@@ -35,6 +109,7 @@ void A2dpSourceSpeaker::setup() {
     return;
   }
   instance_ = this;
+  a2dp_max_bitpool.store(this->max_bitpool_);
 
   const size_t buffer_size = static_cast<size_t>(SAMPLE_RATE) * OUTPUT_FRAME_BYTES * this->buffer_duration_ms_ / 1000;
   this->audio_ring_buffer_ = ring_buffer::RingBuffer::create(buffer_size);
@@ -155,10 +230,13 @@ void A2dpSourceSpeaker::dump_config() {
                 "ESP-IDF A2DP Source Speaker:\n"
                 "  Target address: %s\n"
                 "  Device name: %s\n"
-                "  PCM format: 16-bit, mono/stereo, 44100 Hz\n"
+                "  PCM input: 16-bit, mono/stereo, 8000-48000 Hz\n"
+                "  A2DP output: 16-bit, stereo, 44100 Hz\n"
+                "  SBC maximum bitpool: %u\n"
                 "  Buffer duration: %" PRIu32 " ms\n"
                 "  PCM encoder boundary: ESP-IDF legacy source callback",
-                this->target_address_.c_str(), this->device_name_.c_str(), this->buffer_duration_ms_);
+                this->target_address_.c_str(), this->device_name_.c_str(), this->max_bitpool_,
+                this->buffer_duration_ms_);
 }
 
 size_t A2dpSourceSpeaker::play(const uint8_t *data, size_t length, TickType_t ticks_to_wait) {
@@ -175,7 +253,13 @@ size_t A2dpSourceSpeaker::play(const uint8_t *data, size_t length, TickType_t ti
     return 0;
   }
   this->format_error_logged_ = false;
-  this->source_channels_.store(this->audio_stream_info_.get_channels());
+  const uint8_t channels = this->audio_stream_info_.get_channels();
+  const uint32_t sample_rate = this->audio_stream_info_.get_sample_rate();
+  if (this->play_requested_.load() &&
+      (channels != this->source_channels_.load() || sample_rate != this->source_sample_rate_.load())) {
+    ESP_LOGE(TAG, "PCM format changed during playback");
+    return 0;
+  }
 
   if (this->state_ == speaker::STATE_STOPPED) {
     this->start();
@@ -184,11 +268,15 @@ size_t A2dpSourceSpeaker::play(const uint8_t *data, size_t length, TickType_t ti
     vTaskDelay(ticks_to_wait);
     return 0;
   }
-  // Match ESPHome's speaker contract: the pipeline retains unwritten bytes and retries them.
-  // Partial writes are required when a decoded transfer block is larger than this speaker's ring buffer.
-  const size_t bytes_written = this->audio_ring_buffer_->write_without_replacement(data, length, ticks_to_wait, true);
-  this->stats_bytes_enqueued_.fetch_add(bytes_written);
-  return bytes_written;
+  size_t bytes_consumed = 0;
+  if (sample_rate == SAMPLE_RATE && channels == 2) {
+    // Preserve the cheap passthrough path for the native A2DP PCM format.
+    bytes_consumed = this->audio_ring_buffer_->write_without_replacement(data, length, ticks_to_wait, true);
+  } else {
+    bytes_consumed = this->resample_and_enqueue_(data, length, ticks_to_wait);
+  }
+  this->stats_bytes_enqueued_.fetch_add(bytes_consumed);
+  return bytes_consumed;
 }
 
 void A2dpSourceSpeaker::start() {
@@ -204,6 +292,12 @@ void A2dpSourceSpeaker::start() {
   this->audio_ring_buffer_->reset();
   this->reset_playback_stats_();
   this->source_channels_.store(this->audio_stream_info_.get_channels());
+  this->source_sample_rate_.store(this->audio_stream_info_.get_sample_rate());
+  this->resample_next_output_numerator_ = 0;
+  this->resample_previous_left_ = 0;
+  this->resample_previous_right_ = 0;
+  this->resample_has_previous_ = false;
+  this->callback_source_frame_remainder_.store(0);
   this->finish_requested_.store(false);
   this->buffer_drained_.store(false);
   this->play_requested_.store(true);
@@ -249,7 +343,111 @@ void A2dpSourceSpeaker::set_mute_state(bool mute_state) {
 bool A2dpSourceSpeaker::stream_format_supported_() const {
   return this->audio_stream_info_.get_bits_per_sample() == 16 &&
          (this->audio_stream_info_.get_channels() == 1 || this->audio_stream_info_.get_channels() == 2) &&
-         this->audio_stream_info_.get_sample_rate() == SAMPLE_RATE;
+         this->audio_stream_info_.get_sample_rate() >= 8000 && this->audio_stream_info_.get_sample_rate() <= 48000;
+}
+
+size_t A2dpSourceSpeaker::resample_and_enqueue_(const uint8_t *data, size_t length, TickType_t ticks_to_wait) {
+  const uint8_t channels = this->source_channels_.load();
+  const uint32_t source_rate = this->source_sample_rate_.load();
+  const size_t input_frame_bytes = sizeof(int16_t) * channels;
+  const size_t input_frames = length / input_frame_bytes;
+  size_t committed_input_frames = 0;
+
+  while (committed_input_frames < input_frames) {
+    std::array<int16_t, RESAMPLE_SCRATCH_FRAMES * 2> scratch{};
+    size_t scratch_frames = 0;
+    size_t candidate_input_frames = 0;
+
+    bool local_has_previous = this->resample_has_previous_;
+    int16_t local_previous_left = this->resample_previous_left_;
+    int16_t local_previous_right = this->resample_previous_right_;
+    uint32_t local_next_numerator = this->resample_next_output_numerator_;
+
+    size_t output_frame_limit = std::min(RESAMPLE_SCRATCH_FRAMES,
+                                         std::max<size_t>(1, this->audio_ring_buffer_->free() / OUTPUT_FRAME_BYTES));
+
+    while (committed_input_frames + candidate_input_frames < input_frames) {
+      const size_t input_index = committed_input_frames + candidate_input_frames;
+      int16_t current_left = 0;
+      int16_t current_right = 0;
+      std::memcpy(&current_left, data + input_index * input_frame_bytes, sizeof(current_left));
+      if (channels == 2) {
+        std::memcpy(&current_right, data + input_index * input_frame_bytes + sizeof(current_left),
+                    sizeof(current_right));
+      } else {
+        current_right = current_left;
+      }
+
+      size_t outputs_for_frame = 1;
+      if (local_has_previous) {
+        outputs_for_frame = 0;
+        uint32_t probe_numerator = local_next_numerator;
+        while (probe_numerator <= SAMPLE_RATE) {
+          outputs_for_frame++;
+          probe_numerator += source_rate;
+        }
+      }
+
+      if (scratch_frames + outputs_for_frame > output_frame_limit) {
+        if (candidate_input_frames > 0) {
+          break;
+        }
+        // One low-rate input frame can expand to several output frames. Wait for
+        // that small group as a unit so input consumption and phase stay atomic.
+        output_frame_limit = std::min(RESAMPLE_SCRATCH_FRAMES, outputs_for_frame);
+      }
+
+      if (!local_has_previous) {
+        scratch[0] = current_left;
+        scratch[1] = current_right;
+        scratch_frames = 1;
+        local_previous_left = current_left;
+        local_previous_right = current_right;
+        local_next_numerator = source_rate;
+        local_has_previous = true;
+      } else {
+        while (local_next_numerator <= SAMPLE_RATE) {
+          const int64_t inverse = static_cast<int64_t>(SAMPLE_RATE - local_next_numerator);
+          const int64_t forward = static_cast<int64_t>(local_next_numerator);
+          scratch[scratch_frames * 2] = static_cast<int16_t>(
+              (static_cast<int64_t>(local_previous_left) * inverse + static_cast<int64_t>(current_left) * forward +
+               SAMPLE_RATE / 2) /
+              SAMPLE_RATE);
+          scratch[scratch_frames * 2 + 1] = static_cast<int16_t>(
+              (static_cast<int64_t>(local_previous_right) * inverse + static_cast<int64_t>(current_right) * forward +
+               SAMPLE_RATE / 2) /
+              SAMPLE_RATE);
+          scratch_frames++;
+          local_next_numerator += source_rate;
+        }
+        local_next_numerator -= SAMPLE_RATE;
+        local_previous_left = current_left;
+        local_previous_right = current_right;
+      }
+      candidate_input_frames++;
+
+      if (scratch_frames >= output_frame_limit) {
+        break;
+      }
+    }
+
+    if (candidate_input_frames == 0) {
+      break;
+    }
+    if (scratch_frames > 0 &&
+        this->audio_ring_buffer_->write_without_replacement(scratch.data(), scratch_frames * OUTPUT_FRAME_BYTES,
+                                                            ticks_to_wait, false) == 0) {
+      break;
+    }
+
+    this->resample_has_previous_ = local_has_previous;
+    this->resample_previous_left_ = local_previous_left;
+    this->resample_previous_right_ = local_previous_right;
+    this->resample_next_output_numerator_ = local_next_numerator;
+    committed_input_frames += candidate_input_frames;
+  }
+
+  return committed_input_frames * input_frame_bytes;
 }
 
 bool A2dpSourceSpeaker::parse_target_address_() {
@@ -484,49 +682,29 @@ int32_t A2dpSourceSpeaker::fill_audio_(uint8_t *data, int32_t length) {
   }
 
   const size_t output_frames = static_cast<size_t>(length) / OUTPUT_FRAME_BYTES;
-  size_t input_frames_read = 0;
-  size_t input_bytes_read = 0;
-
-  if (this->source_channels_.load() == 2) {
-    const size_t bytes_requested = output_frames * OUTPUT_FRAME_BYTES;
-    const size_t bytes_read = this->audio_ring_buffer_->read(data, bytes_requested, 0);
-    input_bytes_read = bytes_read;
-    input_frames_read = bytes_read / OUTPUT_FRAME_BYTES;
-  } else {
-    int16_t mono_samples[MONO_SCRATCH_SAMPLES];
-    auto *stereo_samples = reinterpret_cast<int16_t *>(data);
-    size_t output_frame_offset = 0;
-    while (output_frame_offset < output_frames) {
-      const size_t requested_frames = std::min(MONO_SCRATCH_SAMPLES, output_frames - output_frame_offset);
-      const size_t bytes_read =
-          this->audio_ring_buffer_->read(mono_samples, requested_frames * sizeof(int16_t), 0);
-      input_bytes_read += bytes_read;
-      const size_t frames_read = bytes_read / sizeof(int16_t);
-      for (size_t i = 0; i < frames_read; i++) {
-        stereo_samples[(output_frame_offset + i) * 2] = mono_samples[i];
-        stereo_samples[(output_frame_offset + i) * 2 + 1] = mono_samples[i];
-      }
-      input_frames_read += frames_read;
-      output_frame_offset += frames_read;
-      if (frames_read < requested_frames) {
-        break;
-      }
-    }
-  }
+  const size_t output_bytes_read = this->audio_ring_buffer_->read(data, output_frames * OUTPUT_FRAME_BYTES, 0);
+  const size_t output_frames_read = output_bytes_read / OUTPUT_FRAME_BYTES;
 
   const int64_t callback_us = esp_timer_get_time();
   int64_t expected_first_callback_us = 0;
   this->stats_first_callback_us_.compare_exchange_strong(expected_first_callback_us, callback_us);
   this->stats_last_callback_us_.store(callback_us);
   this->stats_callback_count_.fetch_add(1);
-  this->stats_input_bytes_consumed_.fetch_add(input_bytes_read);
+  this->stats_input_bytes_consumed_.fetch_add(output_bytes_read);
   this->stats_output_bytes_requested_.fetch_add(static_cast<uint64_t>(length));
-  const size_t output_audio_bytes = input_frames_read * OUTPUT_FRAME_BYTES;
+  const size_t output_audio_bytes = output_frames_read * OUTPUT_FRAME_BYTES;
   this->stats_silence_bytes_.fetch_add(static_cast<uint64_t>(length) - output_audio_bytes);
 
-  this->apply_volume_(reinterpret_cast<int16_t *>(data), input_frames_read * 2);
-  if (input_frames_read > 0) {
-    this->audio_output_callback_(input_frames_read, callback_us);
+  this->apply_volume_(reinterpret_cast<int16_t *>(data), output_frames_read * 2);
+  if (output_frames_read > 0) {
+    const uint64_t source_frame_numerator =
+        static_cast<uint64_t>(output_frames_read) * this->source_sample_rate_.load() +
+        this->callback_source_frame_remainder_.load();
+    const size_t source_frames = source_frame_numerator / SAMPLE_RATE;
+    this->callback_source_frame_remainder_.store(source_frame_numerator % SAMPLE_RATE);
+    if (source_frames > 0) {
+      this->audio_output_callback_(source_frames, callback_us);
+    }
   }
   if (this->finish_requested_.load() && this->audio_ring_buffer_->available() == 0) {
     this->buffer_drained_.store(true);

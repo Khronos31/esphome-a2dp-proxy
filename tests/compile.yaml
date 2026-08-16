@@ -12,8 +12,6 @@ esp32:
   flash_size: 8MB
   framework:
     type: esp-idf
-    sdkconfig_options:
-      CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: y
     advanced:
       minimum_chip_revision: "3.1"
 
@@ -26,6 +24,8 @@ external_components:
     components: [a2dp_source]
 
 logger:
+  logs:
+    esp-idf: NONE
 
 wifi:
   ssid: build-test
@@ -44,23 +44,17 @@ speaker:
   - platform: a2dp_source
     id: a2dp_output
     target_address: "00:11:22:33:44:55"
+    max_bitpool: 32
     buffer_duration: 750ms
-
-  - platform: resampler
-    id: a2dp_resampled
-    output_speaker: a2dp_output
-    bits_per_sample: 16
-    sample_rate: 44100
-    buffer_duration: 200ms
-    task_stack_in_psram: true
 
 media_player:
   - platform: speaker
     id: a2dp_media_player
     name: Bluetooth Speaker
     buffer_size: 400000
-    task_stack_in_psram: true
     volume_initial: 50%
     announcement_pipeline:
-      speaker: a2dp_resampled
-      format: NONE
+      speaker: a2dp_output
+      format: MP3
+      sample_rate: 44100
+      num_channels: 2

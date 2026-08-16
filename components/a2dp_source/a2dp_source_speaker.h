@@ -34,6 +34,7 @@ class A2dpSourceSpeaker : public Component, public speaker::Speaker {
 
   void set_target_address(const std::string &address) { this->target_address_ = address; }
   void set_device_name(const std::string &name) { this->device_name_ = name; }
+  void set_max_bitpool(uint8_t max_bitpool) { this->max_bitpool_ = max_bitpool; }
   void set_buffer_duration(uint32_t duration_ms) { this->buffer_duration_ms_ = duration_ms; }
 
  protected:
@@ -53,6 +54,7 @@ class A2dpSourceSpeaker : public Component, public speaker::Speaker {
   bool check_(esp_err_t result, const char *operation);
   bool is_target_(const esp_bd_addr_t address) const;
   bool stream_format_supported_() const;
+  size_t resample_and_enqueue_(const uint8_t *data, size_t length, TickType_t ticks_to_wait);
   void request_media_retry_();
   void apply_volume_(int16_t *samples, size_t sample_count) const;
   void reset_playback_stats_();
@@ -63,6 +65,7 @@ class A2dpSourceSpeaker : public Component, public speaker::Speaker {
   std::string target_address_;
   std::string device_name_;
   esp_bd_addr_t target_bda_{};
+  uint8_t max_bitpool_{32};
   uint32_t buffer_duration_ms_{500};
   std::unique_ptr<ring_buffer::RingBuffer> audio_ring_buffer_;
 
@@ -73,6 +76,7 @@ class A2dpSourceSpeaker : public Component, public speaker::Speaker {
   std::atomic<bool> reconnect_requested_{false};
   std::atomic<bool> media_retry_requested_{false};
   std::atomic<uint8_t> source_channels_{2};
+  std::atomic<uint32_t> source_sample_rate_{44100};
   std::atomic<int32_t> volume_q15_{32767};
   std::atomic<bool> muted_{false};
   std::atomic<ConnectionState> connection_state_{ConnectionState::DISCONNECTED};
@@ -87,9 +91,14 @@ class A2dpSourceSpeaker : public Component, public speaker::Speaker {
   std::atomic<int64_t> stats_first_callback_us_{0};
   std::atomic<int64_t> stats_last_callback_us_{0};
   std::atomic<bool> stats_report_requested_{false};
+  std::atomic<uint64_t> callback_source_frame_remainder_{0};
 
   uint32_t next_connect_at_{0};
   uint32_t next_media_check_at_{0};
+  uint32_t resample_next_output_numerator_{0};
+  int16_t resample_previous_left_{0};
+  int16_t resample_previous_right_{0};
+  bool resample_has_previous_{false};
   bool format_error_logged_{false};
 };
 
