@@ -1,0 +1,67 @@
+substitutions:
+  name: a2dp-proxy
+  friendly_name: A2DP Proxy
+  # Replace this with your speaker's Bluetooth Classic address.
+  target_address: "AA:BB:CC:DD:EE:FF"
+
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  min_version: 2026.7.4
+
+esp32:
+  # ESP32-DevKitC-VE with an ESP32-WROVER-E module and 8 MB flash.
+  board: esp-wrover-kit
+  flash_size: 8MB
+  framework:
+    type: esp-idf
+    sdkconfig_options:
+      CONFIG_BT_ALLOCATION_FROM_SPIRAM_FIRST: y
+    advanced:
+      minimum_chip_revision: "3.1"
+
+psram:
+
+external_components:
+  - source: github://Khronos31/esphome-a2dp-proxy@main
+    components: [a2dp_source]
+
+logger:
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  power_save_mode: none
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+speaker:
+  - platform: a2dp_source
+    id: a2dp_output
+    target_address: ${target_address}
+    buffer_duration: 750ms
+
+  - platform: resampler
+    id: a2dp_resampled
+    output_speaker: a2dp_output
+    bits_per_sample: 16
+    sample_rate: 44100
+    buffer_duration: 200ms
+    task_stack_in_psram: true
+
+media_player:
+  - platform: speaker
+    id: a2dp_media_player
+    name: Bluetooth Speaker
+    buffer_size: 400000
+    task_stack_in_psram: true
+    volume_initial: 50%
+    announcement_pipeline:
+      speaker: a2dp_resampled
+      format: NONE
