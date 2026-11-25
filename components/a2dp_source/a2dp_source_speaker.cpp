@@ -254,13 +254,18 @@ void A2dpSourceSpeaker::dump_config() {
                 "ESP-IDF A2DP Source Speaker:\n"
                 "  Target address: %s\n"
                 "  Device name: %s\n"
-                "  PCM input: 16-bit, mono/stereo, 8000-48000 Hz\n"
+                "  Supported PCM input: 16-bit, mono/stereo, 8000-48000 Hz\n"
                 "  A2DP output: 16-bit, stereo, 44100 Hz\n"
                 "  SBC maximum bitpool: %u\n"
                 "  Buffer duration: %" PRIu32 " ms\n"
+                "  Sample rate config: %" PRIu32 " Hz\n"
+                "  Num channels config: %u\n"
                 "  PCM encoder boundary: ESP-IDF legacy source callback",
                 this->target_address_.c_str(), this->device_name_.c_str(), this->max_bitpool_,
-                this->buffer_duration_ms_);
+                this->buffer_duration_ms_,
+                (unsigned long)this->sample_rate_.value_or(0),
+                (unsigned int)this->num_channels_.value_or(0)
+              );
 }
 
 size_t A2dpSourceSpeaker::play(const uint8_t *data, size_t length, TickType_t ticks_to_wait) {
@@ -277,8 +282,9 @@ size_t A2dpSourceSpeaker::play(const uint8_t *data, size_t length, TickType_t ti
     return 0;
   }
   this->format_error_logged_ = false;
-  const uint8_t channels = this->audio_stream_info_.get_channels();
-  const uint32_t sample_rate = this->audio_stream_info_.get_sample_rate();
+  const uint8_t channels = this->num_channels_.value_or(this->audio_stream_info_.get_channels());
+  const uint32_t sample_rate = this->sample_rate_.value_or(this->audio_stream_info_.get_sample_rate());
+  
   if (this->play_requested_.load() &&
       (channels != this->source_channels_.load() || sample_rate != this->source_sample_rate_.load())) {
     ESP_LOGE(TAG, "PCM format changed during playback");
@@ -315,8 +321,8 @@ void A2dpSourceSpeaker::start() {
   }
   this->audio_ring_buffer_->reset();
   this->reset_playback_stats_();
-  this->source_channels_.store(this->audio_stream_info_.get_channels());
-  this->source_sample_rate_.store(this->audio_stream_info_.get_sample_rate());
+  this->source_channels_.store(this->num_channels_.value_or(this->audio_stream_info_.get_channels()));
+  this->source_sample_rate_.store(this->sample_rate_.value_or(this->audio_stream_info_.get_sample_rate()));
   this->resample_next_output_numerator_ = 0;
   this->resample_previous_left_ = 0;
   this->resample_previous_right_ = 0;
@@ -364,6 +370,7 @@ void A2dpSourceSpeaker::set_mute_state(bool mute_state) {
   this->muted_.store(mute_state);
 }
 
+// @TODO: Update logic, don't check for audio_stream_info_ properties if sample_rate and num_channels have been set in the config
 bool A2dpSourceSpeaker::stream_format_supported_() const {
   return this->audio_stream_info_.get_bits_per_sample() == 16 &&
          (this->audio_stream_info_.get_channels() == 1 || this->audio_stream_info_.get_channels() == 2) &&
