@@ -36,6 +36,8 @@ class A2dpSourceSpeaker : public Component, public speaker::Speaker {
   void set_device_name(const std::string &name) { this->device_name_ = name; }
   void set_max_bitpool(uint8_t max_bitpool) { this->max_bitpool_ = max_bitpool; }
   void set_buffer_duration(uint32_t duration_ms) { this->buffer_duration_ms_ = duration_ms; }
+  void set_sample_rate(uint32_t sample_rate) { this->sample_rate_ = sample_rate; }
+  void set_num_channels(uint8_t num_channels) { this->num_channels_ = num_channels; }
 
   float get_buffer_level_ms() const;
   float take_recent_silence_percent();
@@ -73,6 +75,8 @@ class A2dpSourceSpeaker : public Component, public speaker::Speaker {
   uint8_t max_bitpool_{32};
   uint32_t buffer_duration_ms_{500};
   std::unique_ptr<ring_buffer::RingBuffer> audio_ring_buffer_;
+  esphome::optional<uint32_t> sample_rate_;
+  esphome::optional<uint8_t> num_channels_;
 
   std::atomic<bool> profile_ready_{false};
   std::atomic<bool> play_requested_{false};

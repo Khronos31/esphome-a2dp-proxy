@@ -58,8 +58,8 @@ CONFIG_SCHEMA = cv.All(
                 CONF_BUFFER_DURATION, default="500ms"
             ): cv.positive_time_period_milliseconds,
             cv.Optional(CONF_BITS_PER_SAMPLE, default=16): cv.one_of(16, int=True),
-            cv.Optional(CONF_NUM_CHANNELS, default=2): cv.int_range(min=1, max=2),
-            cv.Optional(CONF_SAMPLE_RATE, default=44100): cv.int_range(min=8000, max=48000),
+            cv.Optional(CONF_NUM_CHANNELS): cv.int_range(min=1, max=2),
+            cv.Optional(CONF_SAMPLE_RATE): cv.int_range(min=8000, max=48000),
         }
     ).extend(cv.COMPONENT_SCHEMA),
     cv.only_on_esp32,
@@ -76,6 +76,8 @@ async def to_code(config):
     cg.add(var.set_device_name(config[CONF_DEVICE_NAME]))
     cg.add(var.set_max_bitpool(config[CONF_MAX_BITPOOL]))
     cg.add(var.set_buffer_duration(config[CONF_BUFFER_DURATION]))
+    cg.add_optional(var.set_sample_rate, config.get(CONF_SAMPLE_RATE))
+    cg.add_optional(var.set_num_channels, config.get(CONF_NUM_CHANNELS))
 
     esp32.request_bluetooth()
     esp32.request_software_coexistence()
